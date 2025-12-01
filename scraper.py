@@ -155,6 +155,9 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
     last_exc = None
     for attempt in range(1, retries + 2):
         try:
+            if attempt == retries + 1:
+                time.sleep(10)
+
             article = Article(url)
             article.download()
             article.parse()
@@ -180,14 +183,14 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
                     data["_nlp_error"] = str(nlp_e)
 
             # polite jitter
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(2, 6))
             return data
 
         except Exception as e:
             last_exc = e
             logger.warning(f"Attempt {attempt} failed to download/parse {url}: {e}")
             # backoff
-            time.sleep(1.2 * attempt + random.random())
+            time.sleep(3 * attempt + random.random())
 
     # If it reaches here, all retries failed - raise so caller can log/store failure
     raise last_exc
