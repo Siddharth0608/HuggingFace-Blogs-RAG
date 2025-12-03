@@ -146,7 +146,7 @@ def get_links_first_page() -> List[str]:
                 pass
 
 # ------------------ Links collector (same logic, one driver) ------------------
-def get_links_from_every_page(start_page: int = 0) -> List[str]:
+def get_links_from_every_page(start_page: int = 0) -> None:
     """
     Collect all article links paginated at https://huggingface.co/blog?p={page}
     Uses the same class 'shadow-xs' that you used originally.
@@ -203,10 +203,11 @@ def get_links_from_every_page(start_page: int = 0) -> List[str]:
 
     unique_links = list(set(all_links))
     logger.info(f"Total unique article links collected: {len(unique_links)}")
-    return unique_links
+    save_links(unique_links)
+    # return unique_links
 
 
-def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> Tuple[List[str], List[str]]:
+def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> None:
     """
     Assumes links_file exists (first-run check is done by caller).
     1) Load existing links.
@@ -246,15 +247,7 @@ def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> Tuple[List[
 
     # prepend the new links (preserve order: newest first as they appear on first page)
     updated = list(dict.fromkeys(new_links + existing))  # dedupe and keep order (new first)
-    try:
-        with open(links_file, "w") as f:
-            json.dump(updated, f, indent=2)
-        logger.info(f"Prepended {len(new_links)} new links to {links_file}. Total now: {len(updated)}")
-    except Exception as e:
-        logger.error(f"Failed to write updated links file {links_file}: {e}")
-        # still return the computed in-memory values
-    return updated, new_links
-
+    save_links(updated)
 
 # ------------------ Save/load links ------------------
 def save_links(links: List[str], path: str = LINKS_FILE):
@@ -313,8 +306,7 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
                 "Publish Date": article.publish_date.isoformat() if article.publish_date else None,
                 "Text": article.text or "",
                 "link": url,
-                "scraped_at": datetime.utcnow().isoformat() + "Z",
-            }
+                    }
 
             if do_nlp:
                 try:
@@ -477,8 +469,11 @@ if __name__ == "__main__":
     if os.path.exists(LINKS_FILE):
         check_and_update_links_top_page()
 
-    all_links = get_links_from_every_page()
-    save_links(all_links, LINKS_FILE)
+    else:
+        get_links_from_every_page()
+        # save_links(all_links, LINKS_FILE)
+
+    all_links = load_links()
 
     # 2) scrape all with repeated rounds until everything is clean or max_rounds hit
     articles, failed_links = scrape_all_with_retries(
