@@ -5,7 +5,7 @@ Minimal changes from your original code:
 - keep get_driver(), get_links_from_every_page(), scrape_articles(urls)
 - save links to a separate file for later use
 - add a global retry loop until all articles are scraped or max rounds reached
-- keep multiprocessing + checkpointing + error persistence
+- FIXED: proper periodic run support with dataset up-to-date checks
 """
 
 import json
@@ -201,13 +201,12 @@ def get_links_from_every_page(start_page: int = 0) -> None:
             except Exception:
                 pass
 
-    unique_links = list(set(all_links))
+    unique_links = list(dict.fromkeys(all_links))
     logger.info(f"Total unique article links collected: {len(unique_links)}")
     save_links(unique_links)
-    # return unique_links
 
 
-def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> None:
+def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> List[str]:
     """
     Assumes links_file exists (first-run check is done by caller).
     1) Load existing links.
@@ -215,7 +214,7 @@ def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> None:
     3) Compare top_links with existing[:len(top_links)].
        If union size equals length of existing[:len(top_links)] then no new links.
        Otherwise prepend only the new top-links to the saved file.
-    Returns: (updated_links_in_memory, new_links_found)
+    Returns: list of new links found (empty if none)
     """
     # load existing links (caller ensured file exists, but we still handle errors)
     existing = load_links(links_file)
@@ -224,7 +223,7 @@ def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> None:
     top_links = get_links_first_page()
     if not top_links:
         logger.info("No links found on first page; leaving links file unchanged.")
-        return existing, []
+        return []
 
     # compare only against top N of existing where N = number of links found on first page
     n = len(top_links)
@@ -236,18 +235,20 @@ def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> None:
     # if union length equals length of existing_top_n -> no new links (no change)
     if union_len == len(existing_top_n):
         logger.info("No new links on first page compared to saved top-N. No update needed.")
-        return existing, []
+        return []
 
     # otherwise find which top page links are not already present in the saved top-N
     new_links = [l for l in top_links if l not in existing_top_n]
     if not new_links:
         # defensive: if union_len differs for some weird reason but no new links, treat as no-change
         logger.info("Union indicated change but no new links found (odd). No update.")
-        return existing, []
+        return []
 
     # prepend the new links (preserve order: newest first as they appear on first page)
     updated = list(dict.fromkeys(new_links + existing))  # dedupe and keep order (new first)
     save_links(updated)
+    logger.info(f"Prepended {len(new_links)} new links to {links_file}")
+    return new_links
 
 # ------------------ Save/load links ------------------
 def save_links(links: List[str], path: str = LINKS_FILE):
@@ -272,6 +273,37 @@ def load_links(path: str = LINKS_FILE) -> List[str]:
         logger.error(f"Failed to load links from {path}: {e}")
         return []
 
+# ------------------ Load/save dataset helpers ------------------
+def load_dataset(path: str = OUTPUT_FILE) -> Dict[str, Dict]:
+    """
+    Load existing dataset as a dict keyed by link for fast lookup.
+    Returns: {link: article_data, ...}
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        dataset = {item.get("link"): item for item in data if isinstance(item, dict) and "link" in item}
+        logger.info(f"Loaded {len(dataset)} articles from {path}")
+        return dataset
+    except FileNotFoundError:
+        logger.info(f"Dataset file {path} not found. Starting fresh.")
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to load dataset from {path}: {e}")
+        return {}
+
+def save_dataset(dataset: Dict[str, Dict], path: str = OUTPUT_FILE):
+    """
+    Save dataset dict as a list to JSON file.
+    """
+    try:
+        data = list(dataset.values())
+        with open(path, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"Saved {len(data)} articles to {path}")
+    except Exception as e:
+        logger.error(f"Failed to save dataset to {path}: {e}")
+
 # ------------------ Worker (multiprocessing) ------------------
 def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
     """
@@ -292,10 +324,6 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
         config.browser_user_agent = random.choice(UAS)
 
         try:
-            # if attempt == retries + 1:
-            #     time.sleep(10)  # extra wait on final attempt
-
-            # IMPORTANT: actually use the config now
             article = Article(url, config=config)
             article.download()
             article.parse()
@@ -306,7 +334,7 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
                 "Publish Date": article.publish_date.isoformat() if article.publish_date else None,
                 "Text": article.text or "",
                 "link": url,
-                    }
+            }
 
             if do_nlp:
                 try:
@@ -331,46 +359,39 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
     # If it reaches here, all retries failed - raise so caller can log/store failure
     raise last_exc
 
-# ------------------ scrape_articles (same API, one round) ------------------
+# ------------------ scrape_articles (updated for periodic runs) ------------------
 def scrape_articles(
     urls: Iterable[str],
-    out_checkpoint: str = CHECKPOINT_FILE,
+    existing_dataset: Dict[str, Dict],
     max_workers: int = 6,
-    resume: bool = True,
     do_nlp: bool = True
-) -> List[Dict]:
+) -> Dict[str, Dict]:
     """
     One scraping round over given URLs.
-
-    - Keeps your original function name and top-level usage.
-    - Uses multiprocessing + checkpoint.
-    - Returns a list where some entries may still have '_error'.
+    
+    CHANGED: Now accepts existing_dataset and only processes URLs that:
+    - Don't exist in dataset, OR
+    - Exist but have '_error' field
+    
+    Returns: updated dataset dict
     """
     urls = list(dict.fromkeys(urls))
-    logger.info(f"Starting scrape for {len(urls)} URLs (workers={max_workers})")
-
-    results: List[Dict] = []
-    processed_links = set()
-
-    # load checkpoint if requested (for this round)
-    if resume and os.path.exists(out_checkpoint):
-        try:
-            with open(out_checkpoint, "r") as f:
-                checkpoint_data = json.load(f)
-            for item in checkpoint_data:
-                results.append(item)
-                if isinstance(item, dict) and "link" in item:
-                    processed_links.add(item["link"])
-            logger.info(f"Loaded {len(results)} items from checkpoint {out_checkpoint}")
-        except Exception as e:
-            logger.warning(f"Failed to load checkpoint {out_checkpoint}: {e}")
-
-    to_process = [u for u in urls if u not in processed_links]
-    logger.info(f"{len(to_process)} URLs remain to process after resume/dedupe for this round.")
-
+    logger.info(f"Checking {len(urls)} URLs against existing dataset...")
+    
+    # Filter to only URLs that need scraping
+    to_process = []
+    for url in urls:
+        if url not in existing_dataset:
+            to_process.append(url)
+        elif "_error" in existing_dataset[url]:
+            to_process.append(url)
+            logger.info(f"Re-attempting previously failed URL: {url}")
+    
     if not to_process:
-        logger.info("Nothing to process for this round; returning checkpoint contents.")
-        return results
+        logger.info("All URLs already scraped successfully. Dataset is up-to-date.")
+        return existing_dataset
+    
+    logger.info(f"Need to scrape {len(to_process)} URLs (new or previously failed)")
 
     with ProcessPoolExecutor(max_workers=max_workers) as exe:
         futures = {exe.submit(_article_worker, url, do_nlp): url for url in to_process}
@@ -378,41 +399,53 @@ def scrape_articles(
             url = futures[fut]
             try:
                 data = fut.result()
-                results.append(data)
+                existing_dataset[url] = data
                 logger.info(f"Scraped: {url}")
             except Exception as e:
                 logger.error(f"Permanent failure for {url}: {e}")
-                results.append({"link": url, "_error": str(e)})
-
-            # write checkpoint incrementally for that round
-            try:
-                with open(out_checkpoint, "w") as ck:
-                    json.dump(results, ck, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to write checkpoint file {out_checkpoint}: {e}")
+                existing_dataset[url] = {"link": url, "_error": str(e)}
+            
+            # Save dataset after each article (incremental save)
+            save_dataset(existing_dataset, OUTPUT_FILE)
 
     logger.info("Scraping round finished.")
-    return results
+    return existing_dataset
 
-# ------------------ Global retry orchestrator ------------------
+# ------------------ Global retry orchestrator (updated) ------------------
 def scrape_all_with_retries(
     urls: Iterable[str],
     max_rounds: int = 5,
     max_workers: int = 6,
     do_nlp: bool = True
-) -> (List[Dict], List[str]):
+) -> Tuple[Dict[str, Dict], List[str]]:
     """
     Orchestrates multiple scraping rounds until:
       - all URLs have been scraped with no '_error', or
       - max_rounds is reached.
 
+    CHANGED: Now loads existing dataset and only retries failed URLs
+    
     Returns:
-      final_results: list[dict] (last result per link)
+      final_dataset: dict {link: article_data}
       remaining_failed_links: list[str] (links still with _error after all rounds)
     """
     all_urls = list(dict.fromkeys(urls))
-    results_by_link: Dict[str, Dict] = {u: {} for u in all_urls}
-    remaining = all_urls[:]
+    
+    # Load existing dataset
+    dataset = load_dataset(OUTPUT_FILE)
+    
+    # Find URLs that need scraping
+    urls_needing_scrape = [
+        url for url in all_urls 
+        if url not in dataset or "_error" in dataset.get(url, {})
+    ]
+    
+    if not urls_needing_scrape:
+        logger.info("All URLs already successfully scraped. Dataset is up-to-date.")
+        return dataset, []
+    
+    logger.info(f"Found {len(urls_needing_scrape)} URLs needing scraping (new or failed)")
+    remaining = urls_needing_scrape[:]
 
     for round_idx in range(1, max_rounds + 1):
         if not remaining:
@@ -420,26 +453,19 @@ def scrape_all_with_retries(
             break
 
         logger.info(f"=== Global scraping round {round_idx} with {len(remaining)} URLs ===")
-        # For each global round, we can ignore previous checkpoint resume (we want fresh tries)
-        round_results = scrape_articles(
+        
+        # Scrape only the remaining URLs
+        dataset = scrape_articles(
             remaining,
-            out_checkpoint=CHECKPOINT_FILE,
+            existing_dataset=dataset,
             max_workers=max_workers,
-            resume=False,
             do_nlp=do_nlp,
         )
 
-        # Update latest result per link
-        for item in round_results:
-            link = item.get("link")
-            if not link:
-                continue
-            results_by_link[link] = item
-
         # Determine which still failed
         remaining = [
-            link for link, item in results_by_link.items()
-            if not item or "_error" in item
+            url for url in remaining
+            if "_error" in dataset.get(url, {})
         ]
 
         if remaining:
@@ -450,47 +476,60 @@ def scrape_all_with_retries(
             logger.info("All URLs scraped successfully; no remaining errors.")
             break
 
-    final_results = list(results_by_link.values())
-    failed_links = [link for link, item in results_by_link.items() if "_error" in item]
-    return final_results, failed_links
-
-# ------------------ Save helper ------------------
-def save_json(data: List[Dict], path: str = OUTPUT_FILE):
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=4)
-        logger.info(f"Saved {len(data)} articles to {path}")
-    except Exception as e:
-        logger.error(f"Failed to save JSON to {path}: {e}")
+    failed_links = [url for url, item in dataset.items() if "_error" in item]
+    return dataset, failed_links
 
 # ------------------ Main script flow ------------------
 if __name__ == "__main__":
-    # 1) collect links (once) and save them
+    logger.info("=" * 60)
+    logger.info("Starting HuggingFace Blog Scraper (Periodic Mode)")
+    logger.info("=" * 60)
+    
+    # 1) Handle links collection/update
     if os.path.exists(LINKS_FILE):
-        check_and_update_links_top_page()
-
+        logger.info("Links file exists. Checking for new links on first page...")
+        new_links = check_and_update_links_top_page()
+        if new_links:
+            logger.info(f"Found {len(new_links)} new links on first page.")
+        else:
+            logger.info("No new links found on first page.")
     else:
+        logger.info("Links file not found. Scraping all pages...")
         get_links_from_every_page()
-        # save_links(all_links, LINKS_FILE)
 
+    # 2) Load all links
     all_links = load_links()
+    if not all_links:
+        logger.error("No links available. Exiting.")
+        exit(1)
+    
+    logger.info(f"Total links to process: {len(all_links)}")
 
-    # 2) scrape all with repeated rounds until everything is clean or max_rounds hit
-    articles, failed_links = scrape_all_with_retries(
+    # 3) Scrape with retries (handles up-to-date check internally)
+    dataset, failed_links = scrape_all_with_retries(
         all_links,
         max_rounds=5,   # you can bump this to 999 if you really want "until success"
         max_workers=4,  # tune as per your CPU / network
         do_nlp=True,
     )
 
-    # 3) save final JSON
-    save_json(articles, OUTPUT_FILE)
-
-    # 4) report status
+    # 4) Final report
+    logger.info("=" * 60)
+    logger.info("SCRAPING COMPLETE")
+    logger.info("=" * 60)
+    
+    total_articles = len(dataset)
+    successful = total_articles - len(failed_links)
+    
+    logger.info(f"Total articles: {total_articles}")
+    logger.info(f"Successfully scraped: {successful}")
+    
     if failed_links:
         logger.warning(
-            f"{len(failed_links)} articles still failed after all rounds. "
-            f"Check {OUTPUT_FILE} for _error fields."
+            f"Failed articles: {len(failed_links)} "
+            f"(check {OUTPUT_FILE} for _error fields)"
         )
     else:
-        logger.info("All articles scraped successfully. No _error entries in JSON.")
+        logger.info("✓ Dataset is complete and up-to-date. All articles scraped successfully.")
+    
+    logger.info("=" * 60)
