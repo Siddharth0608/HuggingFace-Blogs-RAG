@@ -1,13 +1,3 @@
-"""
-huggingface_blog_scraper_stable.py
-
-Minimal changes from your original code:
-- keep get_driver(), get_links_from_every_page(), scrape_articles(urls)
-- save links to a separate file for later use
-- add a global retry loop until all articles are scraped or max rounds reached
-- FIXED: proper periodic run support with dataset up-to-date checks
-"""
-
 import json
 import logging
 import os
@@ -28,25 +18,24 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from newspaper import Article, Config
 import requests
 
-# ------------- Global session (not strictly required but fine) -------------
+#Global session (not strictly required but fine)
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 ... Safari/537.36"
 })
 
-# ------------- Newspaper config defaults -------------
+#Newspaper config defaults
 base_config = Config()
 base_config.request_timeout = 10
 base_config.fetch_images = False
 base_config.memoize_articles = False
 
-# ------------------ Configuration ------------------
-CHECKPOINT_FILE = "hg_blogs_checkpoint.json"
-OUTPUT_FILE = "hg_blogs_data.json"
-LINKS_FILE = "hf_blogs_links.json"
+#Configuration
+OUTPUT_FILE = "Dataset/hf_blogs_data.json"
+LINKS_FILE = "Dataset/hf_blogs_links.json"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
-# ------------------ Logging ------------------
+#Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -54,33 +43,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hf_scraper")
 
-# ------------------ get_driver (same essence) ------------------
+#get_driver (same essence)
 def get_driver() -> webdriver.Chrome:
     chrome_options = Options()
 
-    # ------------ HEADLESS MODE ------------
+    #HEADLESS MODE
     chrome_options.add_argument("--headless=new")   # modern headless mode
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
 
-    # ------------ PERFORMANCE / STABILITY ------------
+    # PERFORMANCE / STABILITY
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--disable-extensions")
 
-    # ------------ STEALTH (Avoid detection) ------------
+    # STEALTH (Avoid detection) 
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option("useAutomationExtension", False)
 
-    # ------------ LANGUAGE / LOCALE ------------
+    #  LANGUAGE / LOCALE 
     chrome_options.add_argument("--lang=en-US")
     chrome_options.add_argument(f"user-agent={USER_AGENT}")
 
     driver = webdriver.Chrome(service=Service(), options=chrome_options)
 
-    # ------------ EXTRA STEALTH JS PATCH ------------
+    #  EXTRA STEALTH JS PATCH 
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
@@ -116,7 +105,7 @@ def get_links_first_page() -> List[str]:
             logger.error(f"Driver failed to load first page {url}: {e}")
             return []
 
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 15)
         try:
             elems = wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "shadow-xs")))
         except TimeoutException:
@@ -145,7 +134,7 @@ def get_links_first_page() -> List[str]:
             except Exception:
                 pass
 
-# ------------------ Links collector (same logic, one driver) ------------------
+#  Links collector (same logic, one driver) 
 def get_links_from_every_page(start_page: int = 0) -> None:
     """
     Collect all article links paginated at https://huggingface.co/blog?p={page}
@@ -166,7 +155,7 @@ def get_links_from_every_page(start_page: int = 0) -> None:
                 logger.error(f"Driver failed to load page {hf_blogs_link}: {e}")
                 break
 
-            wait = WebDriverWait(driver, 10)
+            wait = WebDriverWait(driver, 15)
             try:
                 links = wait.until(
                     EC.presence_of_all_elements_located((By.CLASS_NAME, "shadow-xs"))
@@ -250,7 +239,7 @@ def check_and_update_links_top_page(links_file: str = LINKS_FILE) -> List[str]:
     logger.info(f"Prepended {len(new_links)} new links to {links_file}")
     return new_links
 
-# ------------------ Save/load links ------------------
+#  Save/load links 
 def save_links(links: List[str], path: str = LINKS_FILE):
     try:
         unique_links = list(dict.fromkeys(links))
@@ -273,7 +262,7 @@ def load_links(path: str = LINKS_FILE) -> List[str]:
         logger.error(f"Failed to load links from {path}: {e}")
         return []
 
-# ------------------ Load/save dataset helpers ------------------
+#  Load/save dataset helpers 
 def load_dataset(path: str = OUTPUT_FILE) -> Dict[str, Dict]:
     """
     Load existing dataset as a dict keyed by link for fast lookup.
@@ -304,7 +293,7 @@ def save_dataset(dataset: Dict[str, Dict], path: str = OUTPUT_FILE):
     except Exception as e:
         logger.error(f"Failed to save dataset to {path}: {e}")
 
-# ------------------ Worker (multiprocessing) ------------------
+#  Worker (multiprocessing) 
 def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
     """
     Single-URL worker. Designed to be run in a separate process.
@@ -359,7 +348,7 @@ def _article_worker(url: str, do_nlp: bool = True, retries: int = 2) -> Dict:
     # If it reaches here, all retries failed - raise so caller can log/store failure
     raise last_exc
 
-# ------------------ scrape_articles (updated for periodic runs) ------------------
+# scrape_articles (updated for periodic runs) 
 def scrape_articles(
     urls: Iterable[str],
     existing_dataset: Dict[str, Dict],
@@ -411,7 +400,7 @@ def scrape_articles(
     logger.info("Scraping round finished.")
     return existing_dataset
 
-# ------------------ Global retry orchestrator (updated) ------------------
+# Global retry orchestrator (updated)
 def scrape_all_with_retries(
     urls: Iterable[str],
     max_rounds: int = 5,
@@ -479,7 +468,7 @@ def scrape_all_with_retries(
     failed_links = [url for url, item in dataset.items() if "_error" in item]
     return dataset, failed_links
 
-# ------------------ Main script flow ------------------
+# Main script flow
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Starting HuggingFace Blog Scraper (Periodic Mode)")

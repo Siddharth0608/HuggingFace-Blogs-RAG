@@ -1,6 +1,5 @@
 /.vscode
 tester.py
 testing.ipynb
-hg_blogs_checkpoint.json
-hg_blogs_data.json
-hf_blogs_links.json
+Dataset/hf_blogs_data.json
+Dataset/hf_blogs_links.json
