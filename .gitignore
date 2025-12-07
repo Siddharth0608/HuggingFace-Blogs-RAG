@@ -1,6 +1,5 @@
 /.vscode
 tester.py
 testing.ipynb
-Dataset/hf_blogs_data.json
-Dataset/hf_blogs_links.json
-Dataset/hf_blogs_data_backup.json
+/Dataset
+/.batch
