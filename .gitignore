@@ -4,3 +4,4 @@ testing.ipynb
 /Dataset
 /.batch
 vector_store
+vector_db_pipeline.log
